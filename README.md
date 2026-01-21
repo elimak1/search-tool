@@ -25,6 +25,23 @@ Cli tool for searching text documents using: BM25, vector semantic search and LL
 ### Combining strategy
 
 
+Reciprocal Rank Fusion (RRF) with position aware blending
+
+- original query 2x weight, expanded query 1x weight
+- full text search and vector index for both queries
+- combine reults with RRF 
+RRF formula:
+- `sum over result sets (1 / (rank_i + k))`
+- k smoothing factor set to 50
+- Take top 30 results for reranking
+- LLM scores each result (yes/no), convert logprob to score (0-10)
+- Position aware blending:
+
+Position-Aware Blending:
+   - RRF rank 1-3: 75% retrieval, 25% reranker (preserves exact matches)
+   - RRF rank 4-10: 60% retrieval, 40% reranker
+   - RRF rank 11+: 40% retrieval, 60% reranker (trust reranker more)
+
 ## Requirements
 
 - **Bun** >= 1.0.0
@@ -44,4 +61,15 @@ Cli tool for searching text documents using: BM25, vector semantic search and LL
 bun install
 ```
 
-## Usage
+## Indexing
+
+File -> FTS5 index -> SQLite database
+
+## Embedding
+
+
+Document -> Format for EmbeddingGemma -> EmbeddingGemma -> Vector
+
+## Searching
+
+Query -> Query expansion -> BM25 + vector semantic search -> RRF -> LLM re-ranking -> Results
