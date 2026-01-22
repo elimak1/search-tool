@@ -1,4 +1,7 @@
 node_modules/
 *.sqlite
+.cache/
 .DS_Store
 .cursor/
+CLAUDE.MD
+test_files/

@@ -1,6 +1,6 @@
 {
   "name": "search-tool",
-  "module": "index.ts",
+  "module": "st.ts",
   "type": "module",
   "private": true,
   "devDependencies": {
@@ -8,5 +8,8 @@
   },
   "peerDependencies": {
     "typescript": "^5"
+  },
+  "dependencies": {
+    "sqlite-vec": "^0.1.7-alpha.2"
   }
 }
