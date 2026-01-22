@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import * as sqliteVec from "sqlite-vec";
-import { resolve } from "node:path";
+import { resolve, basename } from "node:path";
 
 function getDb() {
   const db = new Database(".cache/search.db");
@@ -53,12 +53,39 @@ function getDb() {
   return db;
 }
 
-async function indexFiles(indexPath: string) {
+function dropCollection(name: string) {
+  const db = getDb();
+  const col = db
+    .query<
+      { id: number },
+      [string]
+    >(`SELECT id FROM collections WHERE name = ?`)
+    .get(name);
+  if (!col) return false;
+
+  db.run(
+    `DELETE FROM documents_fts WHERE rowid IN (SELECT id FROM documents WHERE collection_id = ?)`,
+    [col.id],
+  );
+  db.run(
+    `DELETE FROM document_embeddings WHERE document_id IN (SELECT id FROM documents WHERE collection_id = ?)`,
+    [col.id],
+  );
+  db.run(`DELETE FROM documents WHERE collection_id = ?`, [col.id]);
+  db.run(`DELETE FROM collections WHERE id = ?`, [col.id]);
+  return true;
+}
+
+async function indexFiles(indexPath: string, drop = false) {
   const db = getDb();
   const absolutePath = resolve(indexPath);
+  const collectionName = basename(absolutePath);
 
-  // Create or get collection
-  const collectionName = indexPath.replace(/[^a-zA-Z0-9]/g, "_");
+  if (drop) {
+    dropCollection(collectionName);
+    console.log(`Dropped collection "${collectionName}"`);
+    return;
+  }
   db.run(`INSERT OR IGNORE INTO collections (name, path) VALUES (?, ?)`, [
     collectionName,
     absolutePath,
@@ -188,20 +215,42 @@ function listCollections() {
   }
 }
 
+async function updateAll() {
+  const db = getDb();
+  const collections = db
+    .query<{ path: string }, []>(`SELECT path FROM collections`)
+    .all();
+
+  if (!collections.length) {
+    console.log("No collections to update.");
+    return;
+  }
+
+  for (const c of collections) {
+    console.log(`\nUpdating: ${c.path}`);
+    await indexFiles(c.path);
+  }
+}
+
 const rawArgs = process.argv.slice(2);
 const cmd = rawArgs[0];
 
 // Todo usage instructions
 
 if (cmd === "index") {
-  await indexFiles(rawArgs[1] ?? ".");
+  const drop = rawArgs.includes("--drop");
+  const path = rawArgs.slice(1).find((a) => !a.startsWith("--")) ?? ".";
+  await indexFiles(path, drop);
 } else if (cmd === "collections") {
   listCollections();
+} else if (cmd === "update") {
+  await updateAll();
 } else {
   console.log(`Usage: st <command>
 
 Commands:
-  index <path>     Index files in a directory (default: .)
-  collections      List all collections`);
+  index <path> [--drop]  Index files in a directory (default: .)
+  collections            List all collections
+  update                 Re-index all collections`);
   if (cmd) console.log(`\nUnknown command: ${cmd}`);
 }
