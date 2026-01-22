@@ -4,6 +4,15 @@ import { resolve, basename } from "node:path";
 
 const EMBED_MODEL = "embeddinggemma";
 
+function progress(current: number, total: number, label: string) {
+  const pct = Math.round((current / total) * 100);
+  process.stdout.write(`\r\x1b[K${label}: ${current}/${total} (${pct}%)`);
+}
+
+function progressDone() {
+  process.stdout.write("\n");
+}
+
 function getDb() {
   const db = new Database(".cache/search.db");
   sqliteVec.load(db);
@@ -108,7 +117,7 @@ async function indexFiles(indexPath: string, drop = false) {
 
   // Discover text files
   const glob = new Bun.Glob("**/*.{txt,md}");
-  const files = glob.scanSync({ cwd: absolutePath, absolute: true });
+  const files = [...glob.scanSync({ cwd: absolutePath, absolute: true })];
 
   let indexed = 0;
   for (const filePath of files) {
@@ -160,8 +169,9 @@ async function indexFiles(indexPath: string, drop = false) {
     }
 
     indexed++;
-    console.log(`Indexed: ${relativePath}`);
+    progress(indexed, files.length, "Indexing");
   }
+  if (indexed > 0) progressDone();
 
   // Remove deleted files from collection
   const allDocs = db
@@ -251,31 +261,28 @@ async function getEmbedding(
   return new Float32Array(embeddings[0]);
 }
 
-async function embedDocuments() {
+async function embedDocuments(force = false) {
   const db = getDb();
 
+  if (force) {
+    db.run(`DELETE FROM document_embeddings`);
+    console.log("Cleared all embeddings.");
+  }
+
   // Get docs needing embedding
-  const docs = db
-    .query<
-      { id: number; name: string; content: string; hash: string },
-      [string]
-    >(
-      `
-    SELECT d.id, d.name, d.content, d.hash FROM documents d
-    LEFT JOIN document_embeddings e ON d.id = e.document_id
-    WHERE e.document_id IS NULL OR e.hash != d.hash OR e.model != ?
-  `,
-    )
-    .all(EMBED_MODEL);
+  const docs = db.query<{ id: number; name: string; content: string; hash: string }, [string]>(
+    `SELECT d.id, d.name, d.content, d.hash FROM documents d
+     LEFT JOIN document_embeddings e ON d.id = e.document_id
+     WHERE e.document_id IS NULL OR e.hash != d.hash OR e.model != ?`
+  ).all(EMBED_MODEL);
 
   if (!docs.length) {
     console.log("All documents already embedded.");
     return;
   }
 
-  console.log(`Embedding ${docs.length} documents...`);
-
-  for (const doc of docs) {
+  for (let i = 0; i < docs.length; i++) {
+    const doc = docs[i]!;
     const embedding = await getEmbedding(doc.content, "document", doc.name);
     if (!embedding) {
       console.error(`Failed to embed doc ${doc.id}`);
@@ -286,10 +293,11 @@ async function embedDocuments() {
       `INSERT OR REPLACE INTO document_embeddings (document_id, hash, model, embedding) VALUES (?, ?, ?, ?)`,
       [doc.id, doc.hash, EMBED_MODEL, embedding],
     );
-    console.log(`Embedded: doc ${doc.id}`);
+    progress(i + 1, docs.length, "Embedding");
   }
+  progressDone();
 
-  console.log(`\nEmbedded ${docs.length} documents.`);
+  console.log(`Embedded ${docs.length} documents.`);
 }
 
 async function updateAll() {
@@ -323,7 +331,7 @@ if (cmd === "index") {
 } else if (cmd === "update") {
   await updateAll();
 } else if (cmd === "embed") {
-  await embedDocuments();
+  await embedDocuments(rawArgs.includes("--force"));
 } else {
   console.log(`Usage: st <command>
 
@@ -331,6 +339,6 @@ Commands:
   index <path> [--drop]  Index files in a directory (default: .)
   collections            List all collections
   update                 Re-index all collections
-  embed                  Generate embeddings for indexed documents`);
+  embed [--force]        Generate embeddings for indexed documents`);
   if (cmd) console.log(`\nUnknown command: ${cmd}`);
 }
