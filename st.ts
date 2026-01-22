@@ -2,6 +2,8 @@ import { Database } from "bun:sqlite";
 import * as sqliteVec from "sqlite-vec";
 import { resolve, basename } from "node:path";
 
+const EMBED_MODEL = "embeddinggemma";
+
 function getDb() {
   const db = new Database(".cache/search.db");
   sqliteVec.load(db);
@@ -23,6 +25,7 @@ function getDb() {
     CREATE TABLE IF NOT EXISTS documents (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       collection_id INTEGER NOT NULL,
+      name TEXT NOT NULL,
       path TEXT NOT NULL,
       content TEXT NOT NULL,
       hash TEXT NOT NULL,
@@ -42,10 +45,11 @@ function getDb() {
   `);
 
   // Vector table for semantic search embeddings
-  // embeddinggemma3 produces 768-dimensional vectors
   db.run(`
     CREATE VIRTUAL TABLE IF NOT EXISTS document_embeddings USING vec0(
       document_id INTEGER PRIMARY KEY,
+      hash TEXT,
+      model TEXT,
       embedding FLOAT[768]
     )
   `);
@@ -135,8 +139,8 @@ async function indexFiles(indexPath: string, drop = false) {
       );
     } else {
       db.run(
-        `INSERT INTO documents (collection_id, path, content, hash) VALUES (?, ?, ?, ?)`,
-        [collection.id, relativePath, content, hash],
+        `INSERT INTO documents (collection_id, name, path, content, hash) VALUES (?, ?, ?, ?, ?)`,
+        [collection.id, basename(filePath), relativePath, content, hash],
       );
     }
 
@@ -215,6 +219,79 @@ function listCollections() {
   }
 }
 
+function formatForEmbedding(
+  text: string,
+  type: "query" | "document",
+  title?: string,
+): string {
+  if (type === "query") {
+    return `task: search result | query: ${text}`;
+  }
+  return `title: ${title || "none"} | text: ${text}`;
+}
+
+async function getEmbedding(
+  text: string,
+  type: "query" | "document",
+  title?: string,
+): Promise<Float32Array | null> {
+  const prompt = formatForEmbedding(text, type, title);
+  const res = await fetch("http://localhost:11434/api/embed", {
+    method: "POST",
+    body: JSON.stringify({ model: EMBED_MODEL, input: prompt }),
+  });
+
+  if (!res.ok) {
+    console.error(`Ollama error: ${res.status} ${await res.text()}`);
+    return null;
+  }
+
+  const { embeddings } = (await res.json()) as { embeddings: number[][] };
+  if (!embeddings?.[0]) return null;
+  return new Float32Array(embeddings[0]);
+}
+
+async function embedDocuments() {
+  const db = getDb();
+
+  // Get docs needing embedding
+  const docs = db
+    .query<
+      { id: number; name: string; content: string; hash: string },
+      [string]
+    >(
+      `
+    SELECT d.id, d.name, d.content, d.hash FROM documents d
+    LEFT JOIN document_embeddings e ON d.id = e.document_id
+    WHERE e.document_id IS NULL OR e.hash != d.hash OR e.model != ?
+  `,
+    )
+    .all(EMBED_MODEL);
+
+  if (!docs.length) {
+    console.log("All documents already embedded.");
+    return;
+  }
+
+  console.log(`Embedding ${docs.length} documents...`);
+
+  for (const doc of docs) {
+    const embedding = await getEmbedding(doc.content, "document", doc.name);
+    if (!embedding) {
+      console.error(`Failed to embed doc ${doc.id}`);
+      continue;
+    }
+
+    db.run(
+      `INSERT OR REPLACE INTO document_embeddings (document_id, hash, model, embedding) VALUES (?, ?, ?, ?)`,
+      [doc.id, doc.hash, EMBED_MODEL, embedding],
+    );
+    console.log(`Embedded: doc ${doc.id}`);
+  }
+
+  console.log(`\nEmbedded ${docs.length} documents.`);
+}
+
 async function updateAll() {
   const db = getDb();
   const collections = db
@@ -245,12 +322,15 @@ if (cmd === "index") {
   listCollections();
 } else if (cmd === "update") {
   await updateAll();
+} else if (cmd === "embed") {
+  await embedDocuments();
 } else {
   console.log(`Usage: st <command>
 
 Commands:
   index <path> [--drop]  Index files in a directory (default: .)
   collections            List all collections
-  update                 Re-index all collections`);
+  update                 Re-index all collections
+  embed                  Generate embeddings for indexed documents`);
   if (cmd) console.log(`\nUnknown command: ${cmd}`);
 }
