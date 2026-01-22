@@ -270,11 +270,16 @@ async function embedDocuments(force = false) {
   }
 
   // Get docs needing embedding
-  const docs = db.query<{ id: number; name: string; content: string; hash: string }, [string]>(
-    `SELECT d.id, d.name, d.content, d.hash FROM documents d
+  const docs = db
+    .query<
+      { id: number; name: string; content: string; hash: string },
+      [string]
+    >(
+      `SELECT d.id, d.name, d.content, d.hash FROM documents d
      LEFT JOIN document_embeddings e ON d.id = e.document_id
-     WHERE e.document_id IS NULL OR e.hash != d.hash OR e.model != ?`
-  ).all(EMBED_MODEL);
+     WHERE e.document_id IS NULL OR e.hash != d.hash OR e.model != ?`,
+    )
+    .all(EMBED_MODEL);
 
   if (!docs.length) {
     console.log("All documents already embedded.");
@@ -317,6 +322,57 @@ async function updateAll() {
   }
 }
 
+function buildSearchQuery(query: string): string | null {
+  const trimmed = query.trim();
+  if (trimmed.length < 2) return null;
+
+  // Escape quotes for FTS5 (double them)
+  const escaped = trimmed.replace(/"/g, '""');
+  const terms = escaped.split(/\s+/).filter((t) => t.length > 1);
+  if (!terms.length) return null;
+
+  if (terms.length === 1) {
+    return terms[0]!;
+  }
+
+  // Multiple terms: "exact phrase" OR (term1 NEAR term2) OR term1 OR term2
+  const parts = [
+    `"${escaped}"`,
+    `(${terms.join(" NEAR ")})`,
+    terms.join(" OR "),
+  ];
+  return parts.join(" OR ");
+}
+
+type SearchResult = {
+  id: number;
+  name: string;
+  path: string;
+  content: string;
+  score: number;
+};
+
+function searchBM25(query: string, limit = 5): SearchResult[] {
+  const ftsQuery = buildSearchQuery(query);
+  if (!ftsQuery) return [];
+
+  const db = getDb();
+  try {
+    return db
+      .query<SearchResult, [string, number]>(
+        `SELECT d.id, d.name, d.path, d.content, abs(f.rank) as score
+         FROM documents_fts f
+         JOIN documents d ON f.rowid = d.id
+         WHERE documents_fts MATCH ?
+         ORDER BY f.rank
+         LIMIT ?`,
+      )
+      .all(ftsQuery, limit);
+  } catch {
+    return [];
+  }
+}
+
 const rawArgs = process.argv.slice(2);
 const cmd = rawArgs[0];
 
@@ -332,6 +388,21 @@ if (cmd === "index") {
   await updateAll();
 } else if (cmd === "embed") {
   await embedDocuments(rawArgs.includes("--force"));
+} else if (cmd === "search") {
+  const query = rawArgs.slice(1).join(" ");
+  if (!query || query.trim().length < 2) {
+    console.log("Query must be at least 2 characters.");
+    process.exit(1);
+  }
+  const results = searchBM25(query);
+  if (!results.length) {
+    console.log("No results found.");
+    process.exit(0);
+  }
+  for (const r of results) {
+    console.log(`[${r.score.toFixed(2)}] ${r.path}`);
+    console.log(`  ${r.content.slice(0, 100).replace(/\n/g, " ")}...`);
+  }
 } else {
   console.log(`Usage: st <command>
 
@@ -339,6 +410,7 @@ Commands:
   index <path> [--drop]  Index files in a directory (default: .)
   collections            List all collections
   update                 Re-index all collections
-  embed [--force]        Generate embeddings for indexed documents`);
+  embed [--force]        Generate embeddings for indexed documents
+  search <query>         Search indexed documents`);
   if (cmd) console.log(`\nUnknown command: ${cmd}`);
 }
