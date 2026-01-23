@@ -45,8 +45,10 @@ function getDb() {
   `);
 
   // FTS5 virtual table for full-text search (BM25)
+  // name column first for 10x weight in bm25()
   db.run(`
     CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+      name,
       content,
       content_rowid='id',
       tokenize='porter'
@@ -163,8 +165,8 @@ async function indexFiles(indexPath: string, drop = false) {
 
     if (doc) {
       db.run(
-        `INSERT OR REPLACE INTO documents_fts (rowid, content) VALUES (?, ?)`,
-        [doc.id, content],
+        `INSERT OR REPLACE INTO documents_fts (rowid, name, content) VALUES (?, ?, ?)`,
+        [doc.id, basename(filePath), content],
       );
     }
 
@@ -369,13 +371,14 @@ function searchBM25(query: string, limit = 5): SearchResult[] {
   const db = getDb();
   try {
     // Fetch extra results to account for duplicates
+    // bm25 weights: name=10x, content=1x
     const results = db
       .query<SearchResult, [string, number]>(
-        `SELECT d.id, d.name, d.path, d.content, bm25(documents_fts) as score
+        `SELECT d.id, d.name, d.path, d.content, bm25(documents_fts, 10.0, 1.0) as score
          FROM documents_fts f
          JOIN documents d ON f.rowid = d.id
          WHERE documents_fts MATCH ?
-         ORDER BY bm25(documents_fts)
+         ORDER BY bm25(documents_fts, 10.0, 1.0)
          LIMIT ?`,
       )
       .all(ftsQuery, limit * 3);
