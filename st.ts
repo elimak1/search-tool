@@ -122,7 +122,13 @@ async function indexFiles(indexPath: string, drop = false) {
   const files = [...glob.scanSync({ cwd: absolutePath, absolute: true })];
 
   let indexed = 0;
+  const indexedNames = new Set<string>();
   for (const filePath of files) {
+    // Skip duplicate filenames
+    const fileName = basename(filePath);
+    if (indexedNames.has(fileName)) continue;
+    indexedNames.add(fileName);
+
     const file = Bun.file(filePath);
     const content = await file.text();
     const hash = Bun.hash(content).toString(16);
@@ -381,23 +387,51 @@ function searchBM25(query: string, limit = 5): SearchResult[] {
          ORDER BY bm25(documents_fts, 10.0, 1.0)
          LIMIT ?`,
       )
-      .all(ftsQuery, limit * 3);
+      .all(ftsQuery, limit);
 
     if (!results.length) return [];
 
-    // Normalize scores, dedupe by filename, then slice to limit
-    const seen = new Set<string>();
-    return results
-      .map((r) => ({ ...r, score: normalizeBM25(r.score) }))
-      .filter((r) => {
-        if (seen.has(r.name)) return false;
-        seen.add(r.name);
-        return true;
-      })
-      .slice(0, limit);
+    // Normalize scores
+    return results.map((r) => ({ ...r, score: normalizeBM25(r.score) }));
   } catch {
     return [];
   }
+}
+
+async function searchVector(query: string, limit = 5): Promise<SearchResult[]> {
+  const embedding = await getEmbedding(query, "query");
+  if (!embedding) return [];
+
+  const db = getDb();
+
+  const results = db
+    .query<{ document_id: number; distance: number }, [Float32Array, number]>(
+      `SELECT document_id, distance
+       FROM document_embeddings
+       WHERE embedding MATCH ?
+       ORDER BY distance
+       LIMIT ?`,
+    )
+    .all(embedding, limit);
+
+  if (!results.length) return [];
+
+  const docIds = results.map((r) => r.document_id);
+  const docs = db
+    .query<{ id: number; name: string; path: string; content: string }, []>(
+      `SELECT id, name, path, content FROM documents WHERE id IN (${docIds.join(",")})`,
+    )
+    .all();
+
+  const docMap = new Map(docs.map((d) => [d.id, d]));
+
+  return results
+    .map((r) => {
+      const doc = docMap.get(r.document_id);
+      if (!doc) return null;
+      return { ...doc, score: 1 / (r.distance + 1) };
+    })
+    .filter((r): r is SearchResult => r !== null);
 }
 
 function formatResult(r: SearchResult, query: string, idx: number): string {
@@ -459,6 +493,21 @@ if (cmd === "index") {
     if (i > 0) console.log();
     console.log(formatResult(results[i]!, query, i + 1));
   }
+} else if (cmd === "vsearch") {
+  const query = rawArgs.slice(1).join(" ");
+  if (!query || query.trim().length < 2) {
+    console.log("Query must be at least 2 characters.");
+    process.exit(1);
+  }
+  const results = await searchVector(query);
+  if (!results.length) {
+    console.log("No results found.");
+    process.exit(0);
+  }
+  for (let i = 0; i < results.length; i++) {
+    if (i > 0) console.log();
+    console.log(formatResult(results[i]!, query, i + 1));
+  }
 } else {
   console.log(`Usage: st <command>
 
@@ -467,6 +516,7 @@ Commands:
   collections            List all collections
   update                 Re-index all collections
   embed [--force]        Generate embeddings for indexed documents
-  search <query>         Search indexed documents`);
+  search <query>         Search indexed documents (BM25)
+  vsearch <query>        Search indexed documents (vector)`);
   if (cmd) console.log(`\nUnknown command: ${cmd}`);
 }
