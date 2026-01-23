@@ -352,25 +352,78 @@ type SearchResult = {
   score: number;
 };
 
+// Normalize BM25 score to 0-1 range using sigmoid
+function normalizeBM25(score: number): number {
+  // BM25 scores are negative in SQLite (lower = better)
+  // Typical range: -15 (excellent) to -2 (weak match)
+  // Map to 0-1 where higher is better
+  const absScore = Math.abs(score);
+  // Sigmoid-ish normalization: maps ~2-15 range to ~0.1-0.95
+  return 1 / (1 + Math.exp(-(absScore - 5) / 3));
+}
+
 function searchBM25(query: string, limit = 5): SearchResult[] {
   const ftsQuery = buildSearchQuery(query);
   if (!ftsQuery) return [];
 
   const db = getDb();
   try {
-    return db
+    // Fetch extra results to account for duplicates
+    const results = db
       .query<SearchResult, [string, number]>(
-        `SELECT d.id, d.name, d.path, d.content, abs(f.rank) as score
+        `SELECT d.id, d.name, d.path, d.content, bm25(documents_fts) as score
          FROM documents_fts f
          JOIN documents d ON f.rowid = d.id
          WHERE documents_fts MATCH ?
-         ORDER BY f.rank
+         ORDER BY bm25(documents_fts)
          LIMIT ?`,
       )
-      .all(ftsQuery, limit);
+      .all(ftsQuery, limit * 3);
+
+    if (!results.length) return [];
+
+    // Normalize scores, dedupe by filename, then slice to limit
+    const seen = new Set<string>();
+    return results
+      .map((r) => ({ ...r, score: normalizeBM25(r.score) }))
+      .filter((r) => {
+        if (seen.has(r.name)) return false;
+        seen.add(r.name);
+        return true;
+      })
+      .slice(0, limit);
   } catch {
     return [];
   }
+}
+
+function formatResult(r: SearchResult, query: string, idx: number): string {
+  const queryWords = query.toLowerCase().split(/\s+/);
+  const lines = r.content.split("\n").filter((l) => l.trim());
+
+  let bestIdx = 0;
+  let bestCount = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const lineLower = lines[i]!.toLowerCase();
+    const count = queryWords.filter((w) => lineLower.includes(w)).length;
+    if (count > bestCount) {
+      bestCount = count;
+      bestIdx = i;
+    }
+  }
+
+  const snippetLines: string[] = [];
+  if (bestIdx > 0) snippetLines.push(lines[bestIdx - 1]!);
+  snippetLines.push(lines[bestIdx]!);
+  if (bestIdx < lines.length - 1) snippetLines.push(lines[bestIdx + 1]!);
+
+  const snippet = snippetLines
+    .map((l) => l.trim())
+    .join(" ")
+    .slice(0, 100);
+
+  return `${idx}. ${r.name} [${r.score.toFixed(2)}]\n   ${snippet}...`;
 }
 
 const rawArgs = process.argv.slice(2);
@@ -399,9 +452,9 @@ if (cmd === "index") {
     console.log("No results found.");
     process.exit(0);
   }
-  for (const r of results) {
-    console.log(`[${r.score.toFixed(2)}] ${r.path}`);
-    console.log(`  ${r.content.slice(0, 100).replace(/\n/g, " ")}...`);
+  for (let i = 0; i < results.length; i++) {
+    if (i > 0) console.log();
+    console.log(formatResult(results[i]!, query, i + 1));
   }
 } else {
   console.log(`Usage: st <command>
