@@ -3,6 +3,40 @@ import * as sqliteVec from "sqlite-vec";
 import { resolve, basename } from "node:path";
 
 const EMBED_MODEL = "embeddinggemma";
+const EXPAND_MODEL = "qwen3:0.6b";
+
+async function expandQuery(query: string): Promise<string[]> {
+  try {
+    const res = await fetch("http://localhost:11434/api/generate", {
+      method: "POST",
+      body: JSON.stringify({
+        model: EXPAND_MODEL,
+        prompt: `Generate 3 alternative search queries for: "${query}"
+Return only the queries, one per line, no numbers or explanations.`,
+        stream: false,
+      }),
+    });
+
+    if (!res.ok) {
+      console.error(`Expand error: ${res.status}`);
+      return [query];
+    }
+
+    const { response } = (await res.json()) as { response?: string };
+    if (!response) return [query];
+
+    // Parse lines, filter empty, remove numbering/bullets
+    const expanded = response
+      .split("\n")
+      .map((l) => l.replace(/^[\d.\-\*\)]+\s*/, "").trim())
+      .filter((l) => l.length > 0)
+      .slice(0, 3);
+
+    return [query, ...expanded];
+  } catch {
+    return [query];
+  }
+}
 
 function progress(current: number, total: number, label: string) {
   const pct = Math.round((current / total) * 100);
@@ -398,25 +432,53 @@ function searchBM25(query: string, limit = 5): SearchResult[] {
   }
 }
 
-async function searchVector(query: string, limit = 5): Promise<SearchResult[]> {
-  const embedding = await getEmbedding(query, "query");
-  if (!embedding) return [];
-
+async function searchVector(
+  query: string,
+  limit = 5,
+  debug = false,
+): Promise<SearchResult[]> {
   const db = getDb();
+  const queries = await expandQuery(query);
 
-  const results = db
-    .query<{ document_id: number; distance: number }, [Float32Array, number]>(
-      `SELECT document_id, distance
-       FROM document_embeddings
-       WHERE embedding MATCH ?
-       ORDER BY distance
-       LIMIT ?`,
-    )
-    .all(embedding, limit);
+  if (debug) {
+    console.log("Queries:", queries);
+  }
 
-  if (!results.length) return [];
+  // Run search for each query, keep highest score per document
+  const docScores = new Map<number, number>();
 
-  const docIds = results.map((r) => r.document_id);
+  for (const q of queries) {
+    const embedding = await getEmbedding(q, "query");
+    if (!embedding) continue;
+
+    const results = db
+      .query<{ document_id: number; distance: number }, [Float32Array, number]>(
+        `SELECT document_id, distance
+         FROM document_embeddings
+         WHERE embedding MATCH ?
+         ORDER BY distance
+         LIMIT ?`,
+      )
+      .all(embedding, limit * 2);
+
+    for (const r of results) {
+      const score = 1 / (r.distance + 1);
+      const existing = docScores.get(r.document_id) || 0;
+      if (score > existing) {
+        docScores.set(r.document_id, score);
+      }
+    }
+  }
+
+  if (!docScores.size) return [];
+
+  // Sort by score and take top limit
+  const topDocs = [...docScores.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit);
+
+  // Only fetch details for top results
+  const docIds = topDocs.map(([id]) => id);
   const docs = db
     .query<{ id: number; name: string; path: string; content: string }, []>(
       `SELECT id, name, path, content FROM documents WHERE id IN (${docIds.join(",")})`,
@@ -425,11 +487,11 @@ async function searchVector(query: string, limit = 5): Promise<SearchResult[]> {
 
   const docMap = new Map(docs.map((d) => [d.id, d]));
 
-  return results
-    .map((r) => {
-      const doc = docMap.get(r.document_id);
+  return topDocs
+    .map(([id, score]) => {
+      const doc = docMap.get(id);
       if (!doc) return null;
-      return { ...doc, score: 1 / (r.distance + 1) };
+      return { ...doc, score };
     })
     .filter((r): r is SearchResult => r !== null);
 }
@@ -494,12 +556,16 @@ if (cmd === "index") {
     console.log(formatResult(results[i]!, query, i + 1));
   }
 } else if (cmd === "vsearch") {
-  const query = rawArgs.slice(1).join(" ");
+  const debug = rawArgs.includes("--debug");
+  const query = rawArgs
+    .slice(1)
+    .filter((a) => !a.startsWith("--"))
+    .join(" ");
   if (!query || query.trim().length < 2) {
     console.log("Query must be at least 2 characters.");
     process.exit(1);
   }
-  const results = await searchVector(query);
+  const results = await searchVector(query, 5, debug);
   if (!results.length) {
     console.log("No results found.");
     process.exit(0);
@@ -517,6 +583,6 @@ Commands:
   update                 Re-index all collections
   embed [--force]        Generate embeddings for indexed documents
   search <query>         Search indexed documents (BM25)
-  vsearch <query>        Search indexed documents (vector)`);
+  vsearch <query> [--debug]  Search indexed documents (vector)`);
   if (cmd) console.log(`\nUnknown command: ${cmd}`);
 }
