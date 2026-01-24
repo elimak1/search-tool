@@ -5,7 +5,7 @@ import { resolve, basename } from "node:path";
 const EMBED_MODEL = "embeddinggemma";
 const EXPAND_MODEL = "qwen3:0.6b";
 const RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
-const RRF_K = 50;
+const RRF_K = 60;
 
 async function expandQuery(query: string): Promise<string[]> {
   try {
@@ -590,7 +590,7 @@ function logprobToConfidence(logprob: number): number {
 
 function computeRerankScore(logprobs: LogProb[]): number {
   // Find "yes" or "no" token and use its logprob for confidence
-  // Returns: 0-10 score
+  // Returns: 0-1 score
 
   let yesIdx = -1;
   let noIdx = -1;
@@ -615,15 +615,15 @@ function computeRerankScore(logprobs: LogProb[]): number {
 
   if (isYes) {
     const confidence = logprobToConfidence(yesLogprob);
-    // yes with high confidence → 10, yes with low confidence → 6
-    return 6 + confidence * 4;
+    // yes with high confidence → 1, yes with low confidence → 0.6
+    return 0.6 + confidence * 0.4;
   } else if (isNo) {
     const confidence = logprobToConfidence(noLogprob);
-    // no with high confidence → 0, no with low confidence → 4
-    return 4 - confidence * 4;
+    // no with high confidence → 0, no with low confidence → 0.4
+    return 0.4 - confidence * 0.4;
   }
   // Unknown answer → neutral score
-  return 5;
+  return 0.5;
 }
 
 type LogProb = { token: string; logprob: number };
@@ -693,8 +693,6 @@ function positionBlend(
   rrfScore: number,
   rerankerScore: number,
 ): number {
-  const rerankerNorm = rerankerScore / 10;
-
   let retrieverWeight: number;
   if (rrfRank <= 3) {
     retrieverWeight = 0.75;
@@ -704,7 +702,7 @@ function positionBlend(
     retrieverWeight = 0.4;
   }
 
-  return retrieverWeight * rrfScore + (1 - retrieverWeight) * rerankerNorm;
+  return retrieverWeight * rrfScore + (1 - retrieverWeight) * rerankerScore;
 }
 
 async function searchCombined(
@@ -739,20 +737,41 @@ async function searchCombined(
     .sort((a, b) => b.score - a.score)
     .slice(0, 30);
 
-  if (debug) console.log("RRF top:", sorted.length);
+  // Normalize RRF scores to 0-1 range
+  const maxRrfScore = sorted[0]?.score || 1;
+  const normalized = sorted.map((s) => ({
+    ...s,
+    score: s.score / maxRrfScore,
+  }));
+
+  if (debug) console.log("RRF top:", normalized.length);
 
   const rerankerScores = await rerankWithLLM(
     original,
-    sorted.map((s) => s.doc),
+    normalized.map((s) => s.doc),
   );
 
-  const final = sorted.map((s, idx) => {
+  const final = normalized.map((s, idx) => {
     const rerankerScore = rerankerScores.get(s.doc.id) || 5;
     const blendedScore = positionBlend(idx + 1, s.score, rerankerScore);
     return { ...s.doc, score: blendedScore };
   });
 
   return final.sort((a, b) => b.score - a.score).slice(0, limit);
+}
+
+const YELLOW = "\x1b[33m";
+const RESET = "\x1b[0m";
+
+function highlightMatches(text: string, queryWords: string[]): string {
+  // Build regex to match any query word (case insensitive)
+  const escaped = queryWords
+    .filter((w) => w.length > 1)
+    .map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  if (!escaped.length) return text;
+
+  const regex = new RegExp(`(${escaped.join("|")})`, "gi");
+  return text.replace(regex, `${YELLOW}$1${RESET}`);
 }
 
 function formatResult(r: SearchResult, query: string, idx: number): string {
@@ -781,7 +800,9 @@ function formatResult(r: SearchResult, query: string, idx: number): string {
     .join(" ")
     .slice(0, 100);
 
-  return `${idx}. ${r.name} [${r.score.toFixed(2)}]\n   ${snippet}...`;
+  const highlightedSnippet = highlightMatches(snippet, queryWords);
+  const highlightedName = highlightMatches(r.name, queryWords);
+  return `${idx}. ${highlightedName} [${r.score.toFixed(2)}]\n   ${highlightedSnippet}...`;
 }
 
 const rawArgs = process.argv.slice(2);

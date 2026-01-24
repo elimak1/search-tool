@@ -14,9 +14,9 @@ Cli tool for searching text documents using: BM25, vector semantic search and LL
 
 ### Search backends
 
-- BM25 (sqlite3) | abs(score)
+- BM25 (sqlite3) | normalized score
 - vector Cosine distance | 1 / (distance + 1)
-- LLM re-ranking | 0-10 rating
+- LLM re-ranking | 0-1 confidence score
 
 ### Combining strategy
 
@@ -24,12 +24,12 @@ Reciprocal Rank Fusion (RRF) with position aware blending
 
 - original query 2x weight, expanded query 1x weight
 - full text search and vector index for both queries
-- combine reults with RRF
+- combine results with RRF, normalize to 0-1
   RRF formula:
 - `sum over result sets (1 / (rank_i + k))`
-- k smoothing factor set to 50
+- k smoothing factor set to 60
 - Take top 30 results for reranking
-- LLM scores each result (yes/no), convert logprob to score (0-10)
+- LLM scores each result (yes/no), convert logprob to confidence (0-1)
 - Position aware blending:
 
 Position-Aware Blending:
