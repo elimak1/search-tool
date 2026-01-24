@@ -4,6 +4,8 @@ import { resolve, basename } from "node:path";
 
 const EMBED_MODEL = "embeddinggemma";
 const EXPAND_MODEL = "qwen3:0.6b";
+const RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
+const RRF_K = 50;
 
 async function expandQuery(query: string): Promise<string[]> {
   try {
@@ -480,9 +482,10 @@ async function searchVector(
   // Only fetch details for top results
   const docIds = topDocs.map(([id]) => id);
   const docs = db
-    .query<{ id: number; name: string; path: string; content: string }, []>(
-      `SELECT id, name, path, content FROM documents WHERE id IN (${docIds.join(",")})`,
-    )
+    .query<
+      { id: number; name: string; path: string; content: string },
+      []
+    >(`SELECT id, name, path, content FROM documents WHERE id IN (${docIds.join(",")})`)
     .all();
 
   const docMap = new Map(docs.map((d) => [d.id, d]));
@@ -494,6 +497,262 @@ async function searchVector(
       return { ...doc, score };
     })
     .filter((r): r is SearchResult => r !== null);
+}
+
+async function searchVectorSingle(
+  query: string,
+  limit: number,
+): Promise<SearchResult[]> {
+  const embedding = await getEmbedding(query, "query");
+  if (!embedding) return [];
+
+  const db = getDb();
+  const results = db
+    .query<{ document_id: number; distance: number }, [Float32Array, number]>(
+      `SELECT document_id, distance FROM document_embeddings
+       WHERE embedding MATCH ? ORDER BY distance LIMIT ?`,
+    )
+    .all(embedding, limit);
+
+  if (!results.length) return [];
+
+  const docIds = results.map((r) => r.document_id);
+  const docs = db
+    .query<
+      { id: number; name: string; path: string; content: string },
+      []
+    >(`SELECT id, name, path, content FROM documents WHERE id IN (${docIds.join(",")})`)
+    .all();
+
+  const docMap = new Map(docs.map((d) => [d.id, d]));
+
+  return results
+    .map((r) => {
+      const doc = docMap.get(r.document_id);
+      if (!doc) return null;
+      return { ...doc, score: 1 / (r.distance + 1) };
+    })
+    .filter((r): r is SearchResult => r !== null);
+}
+
+function rrfFusion(
+  resultSets: { results: SearchResult[]; weight: number }[],
+): Map<number, { doc: SearchResult; score: number }> {
+  const scores = new Map<number, { doc: SearchResult; score: number }>();
+
+  for (const { results, weight } of resultSets) {
+    for (let rank = 0; rank < results.length; rank++) {
+      const doc = results[rank]!;
+      const rrfScore = weight / (rank + 1 + RRF_K);
+      const existing = scores.get(doc.id);
+      if (existing) {
+        existing.score += rrfScore;
+      } else {
+        scores.set(doc.id, { doc, score: rrfScore });
+      }
+    }
+  }
+
+  return scores;
+}
+
+const RERANK_SYSTEM = `Judge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no".`;
+
+function buildRerankPrompt(
+  query: string,
+  title: string,
+  content: string,
+): string {
+  const userPrompt = `
+<Instruct>: Determine if the document is relevant to the search query. atch documents that discuss the queried topic, even if phrasing differs.
+<Query>: ${query}
+<Document Title>: ${title}
+<Document>: ${content.slice(0, 4000)}`;
+
+  return `<|im_start|>system
+${RERANK_SYSTEM}<|im_end|>
+<|im_start|>user
+${userPrompt}<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+`;
+}
+
+function logprobToConfidence(logprob: number): number {
+  // Convert log probability to probability (0-1)
+  // logprob is typically negative, closer to 0 = higher confidence
+  const prob = Math.exp(logprob);
+  return Math.min(1, Math.max(0, prob));
+}
+
+function computeRerankScore(logprobs: LogProb[]): number {
+  // Find "yes" or "no" token and use its logprob for confidence
+  // Returns: 0-10 score
+
+  let yesIdx = -1;
+  let noIdx = -1;
+  let yesLogprob = 0;
+  let noLogprob = 0;
+
+  for (let i = 0; i < logprobs.length; i++) {
+    const token = logprobs[i]!.token.toLowerCase();
+    if (yesIdx === -1 && token.includes("yes")) {
+      yesIdx = i;
+      yesLogprob = logprobs[i]!.logprob;
+    }
+    if (noIdx === -1 && token.includes("no")) {
+      noIdx = i;
+      noLogprob = logprobs[i]!.logprob;
+    }
+  }
+
+  // Pick whichever appears first (-1 means not found)
+  const isYes = yesIdx !== -1 && (noIdx === -1 || yesIdx < noIdx);
+  const isNo = noIdx !== -1 && (yesIdx === -1 || noIdx < yesIdx);
+
+  if (isYes) {
+    const confidence = logprobToConfidence(yesLogprob);
+    // yes with high confidence → 10, yes with low confidence → 6
+    return 6 + confidence * 4;
+  } else if (isNo) {
+    const confidence = logprobToConfidence(noLogprob);
+    // no with high confidence → 0, no with low confidence → 4
+    return 4 - confidence * 4;
+  }
+  // Unknown answer → neutral score
+  return 5;
+}
+
+type LogProb = { token: string; logprob: number };
+type RerankResponse = {
+  response: string;
+  logprobs?: LogProb[];
+};
+
+async function rerankSingleDoc(
+  query: string,
+  doc: SearchResult,
+): Promise<{ id: number; score: number }> {
+  const prompt = buildRerankPrompt(query, doc.name, doc.content);
+
+  try {
+    const res = await fetch("http://localhost:11434/api/generate", {
+      method: "POST",
+      body: JSON.stringify({
+        model: RERANK_MODEL,
+        prompt,
+        stream: false,
+        raw: true,
+        options: {
+          num_predict: 2,
+        },
+        logprobs: true,
+      }),
+    });
+
+    if (!res.ok) {
+      return { id: doc.id, score: 5 };
+    }
+
+    const data = (await res.json()) as RerankResponse;
+
+    const score = computeRerankScore(data.logprobs ?? []);
+    return { id: doc.id, score };
+  } catch {
+    return { id: doc.id, score: 5 };
+  }
+}
+
+const RERANK_CONCURRENCY = 5;
+
+async function rerankWithLLM(
+  query: string,
+  docs: SearchResult[],
+): Promise<Map<number, number>> {
+  const scores = new Map<number, number>();
+
+  // Process in parallel batches
+  for (let i = 0; i < docs.length; i += RERANK_CONCURRENCY) {
+    const batch = docs.slice(i, i + RERANK_CONCURRENCY);
+    const results = await Promise.all(
+      batch.map((doc) => rerankSingleDoc(query, doc)),
+    );
+    for (const { id, score } of results) {
+      scores.set(id, score);
+    }
+  }
+
+  return scores;
+}
+
+function positionBlend(
+  rrfRank: number,
+  rrfScore: number,
+  rerankerScore: number,
+): number {
+  const rerankerNorm = rerankerScore / 10;
+
+  let retrieverWeight: number;
+  if (rrfRank <= 3) {
+    retrieverWeight = 0.75;
+  } else if (rrfRank <= 10) {
+    retrieverWeight = 0.6;
+  } else {
+    retrieverWeight = 0.4;
+  }
+
+  return retrieverWeight * rrfScore + (1 - retrieverWeight) * rerankerNorm;
+}
+
+async function searchCombined(
+  query: string,
+  limit = 5,
+  debug = false,
+): Promise<SearchResult[]> {
+  const queries = await expandQuery(query);
+  const original = queries[0]!;
+  const expanded = queries.slice(1);
+
+  if (debug) console.log("Queries:", queries);
+
+  // Original query gets higher weight
+  const bm25Original = searchBM25(original, 50);
+  const vecOriginal = await searchVectorSingle(original, 50);
+
+  // Each expanded query as separate result set for proper ranking
+  const bm25Expanded = expanded.map((q) => searchBM25(q, 30));
+  const vecExpanded = await Promise.all(
+    expanded.map((q) => searchVectorSingle(q, 30)),
+  );
+
+  const rrfScores = rrfFusion([
+    { results: bm25Original, weight: 2 },
+    { results: vecOriginal, weight: 2 },
+    ...bm25Expanded.map((results) => ({ results, weight: 1 })),
+    ...vecExpanded.map((results) => ({ results, weight: 1 })),
+  ]);
+
+  const sorted = [...rrfScores.values()]
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 30);
+
+  if (debug) console.log("RRF top:", sorted.length);
+
+  const rerankerScores = await rerankWithLLM(
+    original,
+    sorted.map((s) => s.doc),
+  );
+
+  const final = sorted.map((s, idx) => {
+    const rerankerScore = rerankerScores.get(s.doc.id) || 5;
+    const blendedScore = positionBlend(idx + 1, s.score, rerankerScore);
+    return { ...s.doc, score: blendedScore };
+  });
+
+  return final.sort((a, b) => b.score - a.score).slice(0, limit);
 }
 
 function formatResult(r: SearchResult, query: string, idx: number): string {
@@ -574,6 +833,25 @@ if (cmd === "index") {
     if (i > 0) console.log();
     console.log(formatResult(results[i]!, query, i + 1));
   }
+} else if (cmd === "query") {
+  const debug = rawArgs.includes("--debug");
+  const query = rawArgs
+    .slice(1)
+    .filter((a) => !a.startsWith("--"))
+    .join(" ");
+  if (!query || query.trim().length < 2) {
+    console.log("Query must be at least 2 characters.");
+    process.exit(1);
+  }
+  const results = await searchCombined(query, 5, debug);
+  if (!results.length) {
+    console.log("No results found.");
+    process.exit(0);
+  }
+  for (let i = 0; i < results.length; i++) {
+    if (i > 0) console.log();
+    console.log(formatResult(results[i]!, query, i + 1));
+  }
 } else {
   console.log(`Usage: st <command>
 
@@ -583,6 +861,7 @@ Commands:
   update                 Re-index all collections
   embed [--force]        Generate embeddings for indexed documents
   search <query>         Search indexed documents (BM25)
-  vsearch <query> [--debug]  Search indexed documents (vector)`);
+  vsearch <query> [--debug]  Search indexed documents (vector)
+  query <query> [--debug]    Combined search (BM25 + vector + rerank)`);
   if (cmd) console.log(`\nUnknown command: ${cmd}`);
 }

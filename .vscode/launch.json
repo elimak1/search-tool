@@ -1,0 +1,35 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "bun",
+      "request": "launch",
+      "name": "Debug (with args)",
+      "program": "${workspaceFolder}/st.ts",
+      "args": ["${input:args}"],
+      "cwd": "${workspaceFolder}",
+      "stopOnEntry": false
+    },
+    {
+      "type": "bun",
+      "request": "launch",
+      "name": "Debug query",
+      "program": "${workspaceFolder}/st.ts",
+      "args": ["query", "--debug", "${input:query}"],
+      "cwd": "${workspaceFolder}",
+      "stopOnEntry": false
+    }
+  ],
+  "inputs": [
+    {
+      "id": "args",
+      "type": "promptString",
+      "description": "Arguments to pass to st.ts"
+    },
+    {
+      "id": "query",
+      "type": "promptString",
+      "description": "Search query"
+    }
+  ]
+}

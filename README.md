@@ -62,14 +62,95 @@ ollama pull qwen3:0.6b
 bun install
 ```
 
-## Indexing
+## Usage
+
+### Index documents
+
+Index a directory of text files (`.txt`, `.md`):
+
+```sh
+bun st.ts index <path>
+```
+
+Re-index and drop existing collection:
+
+```sh
+bun st.ts index <path> --drop
+```
+
+### Manage collections
+
+List all indexed collections:
+
+```sh
+bun st.ts collections
+```
+
+Re-index all existing collections:
+
+```sh
+bun st.ts update
+```
+
+### Generate embeddings
+
+Generate vector embeddings for all indexed documents:
+
+```sh
+bun st.ts embed
+```
+
+Force re-embed all documents:
+
+```sh
+bun st.ts embed --force
+```
+
+### Search
+
+**BM25 search** (fast, keyword-based):
+
+```sh
+bun st.ts search <query>
+```
+
+**Vector search** (semantic similarity):
+
+```sh
+bun st.ts vsearch <query>
+bun st.ts vsearch <query> --debug  # Show expanded queries
+```
+
+**Combined search** (BM25 + vector + LLM reranking):
+
+```sh
+bun st.ts query <query>
+bun st.ts query <query> --debug  # Show debug info
+```
+
+### Example workflow
+
+```sh
+# 1. Index your documents
+bun st.ts index ./my-documents
+
+# 2. Generate embeddings
+bun st.ts embed
+
+# 3. Search
+bun st.ts query "how to configure authentication"
+```
+
+## How it works
+
+### Indexing
 
 File -> FTS5 index -> SQLite database
 
-## Embedding
+### Embedding
 
 Document -> Format for EmbeddingGemma -> EmbeddingGemma -> Vector
 
-## Searching
+### Searching
 
 Query -> Query expansion -> BM25 + vector semantic search -> RRF -> LLM re-ranking -> Results
