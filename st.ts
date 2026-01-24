@@ -688,11 +688,9 @@ async function rerankWithLLM(
   return scores;
 }
 
-function positionBlend(
-  rrfRank: number,
-  rrfScore: number,
-  rerankerScore: number,
-): number {
+function positionBlend(rrfRank: number, rerankerScore: number): number {
+  const rrfScore = 1 / rrfRank; // Position-based: 1, 0.5, 0.33...
+
   let retrieverWeight: number;
   if (rrfRank <= 3) {
     retrieverWeight = 0.75;
@@ -737,23 +735,16 @@ async function searchCombined(
     .sort((a, b) => b.score - a.score)
     .slice(0, 30);
 
-  // Normalize RRF scores to 0-1 range
-  const maxRrfScore = sorted[0]?.score || 1;
-  const normalized = sorted.map((s) => ({
-    ...s,
-    score: s.score / maxRrfScore,
-  }));
-
-  if (debug) console.log("RRF top:", normalized.length);
+  if (debug) console.log("RRF top:", sorted.length);
 
   const rerankerScores = await rerankWithLLM(
     original,
-    normalized.map((s) => s.doc),
+    sorted.map((s) => s.doc),
   );
 
-  const final = normalized.map((s, idx) => {
-    const rerankerScore = rerankerScores.get(s.doc.id) || 5;
-    const blendedScore = positionBlend(idx + 1, s.score, rerankerScore);
+  const final = sorted.map((s, idx) => {
+    const rerankerScore = rerankerScores.get(s.doc.id) || 0.5;
+    const blendedScore = positionBlend(idx + 1, rerankerScore);
     return { ...s.doc, score: blendedScore };
   });
 
