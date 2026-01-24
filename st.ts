@@ -1,3 +1,4 @@
+#!/usr/bin/env bun
 import { Database } from "bun:sqlite";
 import * as sqliteVec from "sqlite-vec";
 import { resolve, basename } from "node:path";
@@ -50,7 +51,8 @@ function progressDone() {
 }
 
 function getDb() {
-  const db = new Database(".cache/search.db");
+  const dbPath = resolve(import.meta.dir, ".cache/search.db");
+  const db = new Database(dbPath);
   sqliteVec.load(db);
   db.run("PRAGMA journal_mode = WAL");
 
@@ -757,7 +759,7 @@ const RESET = "\x1b[0m";
 function highlightMatches(text: string, queryWords: string[]): string {
   // Build regex to match any query word (case insensitive)
   const escaped = queryWords
-    .filter((w) => w.length > 1)
+    .filter((w) => w.length > 2)
     .map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
   if (!escaped.length) return text;
 

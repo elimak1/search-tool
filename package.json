@@ -1,8 +1,11 @@
 {
   "name": "search-tool",
+  "version": "0.1.0",
   "module": "st.ts",
   "type": "module",
-  "private": true,
+  "bin": {
+    "st": "./st.ts"
+  },
   "devDependencies": {
     "@types/bun": "latest"
   },
