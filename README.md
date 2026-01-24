@@ -60,6 +60,7 @@ ollama pull qwen3:0.6b
 
 ```sh
 bun install
+bun link    # Makes 'st' command available globally
 ```
 
 ## Usage
@@ -69,13 +70,13 @@ bun install
 Index a directory of text files (`.txt`, `.md`):
 
 ```sh
-bun st.ts index <path>
+st index <path>
 ```
 
 Re-index and drop existing collection:
 
 ```sh
-bun st.ts index <path> --drop
+st index <path> --drop
 ```
 
 ### Manage collections
@@ -83,13 +84,13 @@ bun st.ts index <path> --drop
 List all indexed collections:
 
 ```sh
-bun st.ts collections
+st collections
 ```
 
 Re-index all existing collections:
 
 ```sh
-bun st.ts update
+st update
 ```
 
 ### Generate embeddings
@@ -97,13 +98,13 @@ bun st.ts update
 Generate vector embeddings for all indexed documents:
 
 ```sh
-bun st.ts embed
+st embed
 ```
 
 Force re-embed all documents:
 
 ```sh
-bun st.ts embed --force
+st embed --force
 ```
 
 ### Search
@@ -111,34 +112,34 @@ bun st.ts embed --force
 **BM25 search** (fast, keyword-based):
 
 ```sh
-bun st.ts search <query>
+st search <query>
 ```
 
 **Vector search** (semantic similarity):
 
 ```sh
-bun st.ts vsearch <query>
-bun st.ts vsearch <query> --debug  # Show expanded queries
+st vsearch <query>
+st vsearch <query> --debug  # Show expanded queries
 ```
 
 **Combined search** (BM25 + vector + LLM reranking):
 
 ```sh
-bun st.ts query <query>
-bun st.ts query <query> --debug  # Show debug info
+st query <query>
+st query <query> --debug  # Show debug info
 ```
 
 ### Example workflow
 
 ```sh
 # 1. Index your documents
-bun st.ts index ./my-documents
+st index ./my-documents
 
 # 2. Generate embeddings
-bun st.ts embed
+st embed
 
 # 3. Search
-bun st.ts query "how to configure authentication"
+st query "how to configure authentication"
 ```
 
 ## How it works
